@@ -1,0 +1,59 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables (contains API keys)
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Private documentation
+/docs/
+
+# Node.js dependencies
+node_modules/
+frontend/dist/
+
+# Runtime data
+data/
+
+# SQLite database
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.rdb
+*.dump
+*.sql
+*.pem
+*.key
+*.p12
+*.pfx
+uploads/
+backups/
+docker/certbot/
+
+# IDE
+.vscode/
+.idea/
+.pytest_cache/
+*.log
+*.bak
+*.zip
+
+# Logs
+logs/
+
+# Claude Code local config
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

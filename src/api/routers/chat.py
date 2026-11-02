@@ -1,0 +1,288 @@
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from typing import List, Optional, Any
+from pydantic import BaseModel, Field
+import uuid
+import json
+from queue import Queue, Empty
+from threading import Thread
+
+from src.settings import settings
+from src.database.sql_session import get_db, SessionLocal
+from src.database.models import ChatSession, ChatInteraction, User, KnowledgeBase, Assistant
+from src.services.rag_service import RAGService
+from src.services.memory_service import MemorySystem
+from src.api.dependencies import get_current_user
+from src.services.execution_trace import TracedExecutionError
+from src.utils.logger import logger
+
+router = APIRouter()
+_rag_service: RAGService | None = None
+_memory_system: MemorySystem | None = None
+
+
+def get_rag_service() -> RAGService:
+    global _rag_service
+    if _rag_service is None:
+        _rag_service = RAGService()
+    return _rag_service
+
+
+def get_memory_system() -> MemorySystem:
+    global _memory_system
+    if _memory_system is None:
+        _memory_system = MemorySystem()
+    return _memory_system
+
+class ChatRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+    kb_id: Optional[int] = None # Deprecated/Override
+    assistant_id: Optional[int] = None # New: Select Assistant
+    top_k: int = 5
+    llm_model: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    session_id: str
+    query: str
+    answer: str
+    source_documents: List[Any]
+    execution_trace: Optional[dict] = None
+
+class SessionOut(BaseModel):
+    id: int
+    session_uid: str
+    title: Optional[str]
+    created_at: Any
+    assistant_id: Optional[int]
+    
+    class Config:
+        from_attributes = True
+
+class MessageOut(BaseModel):
+    query: str
+    answer: str
+    created_at: Any
+    source_documents: List[Any] = Field(default_factory=list)
+    execution_trace: Optional[dict] = None
+    status: str = "completed"
+    error: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+@router.post("/", response_model=ChatResponse)
+def chat(request: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return execute_chat(request, current_user, db)
+
+
+@router.post("/stream")
+def stream_chat(request: ChatRequest, current_user: User = Depends(get_current_user)):
+    events = Queue()
+    user_id = current_user.id
+
+    def run():
+        try:
+            with SessionLocal() as db:
+                user = db.get(User, user_id)
+                if user is None:
+                    raise HTTPException(status_code=401, detail="用户不存在")
+                result = execute_chat(request, user, db, on_event=lambda trace: events.put({"type": "trace", "trace": trace}))
+                events.put({"type": "complete", "result": result.model_dump()})
+        except HTTPException as error:
+            detail = error.detail if isinstance(error.detail, dict) else {"message": str(error.detail)}
+            events.put({"type": "error", **detail})
+        except Exception as error:
+            logger.exception(f"执行过程请求失败：{error}")
+            events.put({"type": "error", "message": "请求执行失败，请查看服务日志"})
+
+    def stream():
+        Thread(target=run, daemon=True).start()
+        while True:
+            try:
+                event = events.get(timeout=15)
+            except Empty:
+                yield ": keep-alive\n\n"
+                continue
+            yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+            if event["type"] in ("complete", "error"):
+                break
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def execute_chat(request, current_user, db, on_event=None):
+    # 0. Resolve Assistant & Configuration
+    assistant = None
+    kb_ids = []
+    
+    if request.assistant_id:
+        assistant = db.query(Assistant).filter(Assistant.id == request.assistant_id).first()
+        if not assistant:
+             raise HTTPException(status_code=404, detail="Assistant not found")
+        # Optional: check ownership or public
+        if assistant.user_id != current_user.id:
+             raise HTTPException(status_code=403, detail="Not authorized for this assistant")
+        
+        # Load config from assistant
+        kb_ids = assistant.kb_ids or []
+    elif request.kb_id:
+        # Legacy/Direct KB mode
+        kb_ids = [request.kb_id]
+    
+    # 1. Validate KBs (if any)
+    valid_kb_ids = []
+    if kb_ids:
+        kbs = db.query(KnowledgeBase).filter(KnowledgeBase.id.in_(kb_ids)).all()
+        for kb in kbs:
+            if kb.owner_id == current_user.id or kb.is_public:
+                valid_kb_ids.append(kb.id)
+    
+    # 2. Manage Session
+    session_uid = request.session_id
+    if not session_uid:
+        session_uid = str(uuid.uuid4())
+        chat_session = ChatSession(
+            session_uid=session_uid,
+            user_id=current_user.id,
+            assistant_id=request.assistant_id,
+            title=request.query[:50]  # Simple title generation
+        )
+        db.add(chat_session)
+        db.commit()
+        db.refresh(chat_session)
+    else:
+        chat_session = db.query(ChatSession).filter(ChatSession.session_uid == session_uid).first()
+        if not chat_session:
+            chat_session = ChatSession(
+                session_uid=session_uid,
+                user_id=current_user.id,
+                assistant_id=request.assistant_id,
+                title=request.query[:50]
+            )
+            db.add(chat_session)
+            db.commit()
+            db.refresh(chat_session)
+        
+        if chat_session.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this session")
+
+    # 3. Call RAG Service
+    # Pass assistant config if available
+    assistant_config = {
+        "llm_model": request.llm_model or (assistant.llm_model if assistant else settings.LLM_MODEL),
+        "temperature": assistant.temperature if assistant else 0.7,
+        "system_prompt": assistant.system_prompt if assistant else None,
+        "memory_config": assistant.memory_config if assistant else None,
+        "rag_config": assistant.rag_config if assistant else None,
+        "tool_config": assistant.tool_config if assistant else None,
+        "agent_ids": assistant.agent_ids if assistant else None
+    }
+    
+    try:
+        result = get_rag_service().query(
+            query_text=request.query,
+            top_k=request.top_k,
+            session_id=session_uid,
+            kb_ids=valid_kb_ids, # Pass list of IDs
+            assistant_config=assistant_config,
+            on_event=on_event
+        )
+    except TracedExecutionError as error:
+        db.add(ChatInteraction(session_id=chat_session.id,
+            kb_id=valid_kb_ids[0] if valid_kb_ids else None, query=request.query, answer="",
+            retrieved_docs=[], metrics={"execution_trace": error.trace, "error": str(error)}))
+        db.commit()
+        raise HTTPException(status_code=502, detail={"message": str(error),
+            "execution_trace": error.trace, "session_id": session_uid}) from error
+
+    # 4. Save Interaction
+    interaction = ChatInteraction(
+        session_id=chat_session.id,
+        kb_id=valid_kb_ids[0] if valid_kb_ids else None, # Store primary KB or None
+        query=request.query,
+        answer=result["answer"],
+        retrieved_docs=result.get("source_documents"), # JSON field
+        metrics={**result.get("metrics", {}), "execution_trace": result.get("execution_trace")}
+    )
+    db.add(interaction)
+    db.commit()
+    
+    return ChatResponse(
+        session_id=session_uid,
+        query=request.query,
+        answer=result["answer"],
+        source_documents=result.get("source_documents", []),
+        execution_trace=result.get("execution_trace")
+    )
+
+@router.get("/sessions", response_model=List[SessionOut])
+def list_sessions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return db.query(ChatSession).filter(ChatSession.user_id == current_user.id).order_by(ChatSession.created_at.desc()).all()
+
+@router.get("/sessions/{session_id}/messages", response_model=List[MessageOut])
+def get_session_messages(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    chat_session = db.query(ChatSession).filter(ChatSession.session_uid == session_id).first()
+    if not chat_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if chat_session.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+        
+    interactions = db.query(ChatInteraction).filter(ChatInteraction.session_id == chat_session.id).order_by(ChatInteraction.created_at.asc(), ChatInteraction.id.asc()).all()
+    return [dict(query=item.query, answer=item.answer, created_at=item.created_at,
+                 source_documents=item.retrieved_docs or [],
+                 execution_trace=(item.metrics or {}).get("execution_trace"),
+                 status=((item.metrics or {}).get("execution_trace") or {}).get("status", "completed"),
+                 error=(item.metrics or {}).get("error")) for item in interactions]
+
+@router.delete("/sessions/{session_id}")
+def delete_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    chat_session = db.query(ChatSession).filter(ChatSession.session_uid == session_id).first()
+    if not chat_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if chat_session.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Delete interactions first
+    db.query(ChatInteraction).filter(ChatInteraction.session_id == chat_session.id).delete()
+    db.delete(chat_session)
+    db.commit()
+    
+    # Clear short term memory from Redis
+    try:
+        get_memory_system().clear_short_term_memory(session_id)
+    except Exception as e:
+        print(f"Error clearing memory: {e}")
+    
+    return {"message": "Session deleted"}
+
+@router.delete("/sessions")
+def batch_delete_sessions(
+    session_ids: List[str], # List of session_uids
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    sessions = db.query(ChatSession).filter(ChatSession.session_uid.in_(session_ids)).all()
+    deleted_count = 0
+    
+    for session in sessions:
+        if session.user_id == current_user.id:
+            db.query(ChatInteraction).filter(ChatInteraction.session_id == session.id).delete()
+            db.delete(session)
+            deleted_count += 1
+            
+    db.commit()
+    return {"message": f"Deleted {deleted_count} sessions"}
